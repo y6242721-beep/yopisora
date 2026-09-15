@@ -59,7 +59,7 @@ const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 const BLOCK_RE = /sensitive|privacy|real person|policy|violat|prohibit|nsfw|copyright|infring\w*|ip\s*infring|risk|illegal|moderat|inappropriate|inspection|green net/i;
 
 export class Sd2Error extends Error {
-  constructor(message, { status, code, body, blocked, timedOut } = {}) {
+  constructor(message, { status, code, body, blocked, timedOut, terminal } = {}) {
     super(message);
     this.name = 'Sd2Error';
     this.status = status;
@@ -67,10 +67,30 @@ export class Sd2Error extends Error {
     this.body = body;
     this.blocked = Boolean(blocked);
     this.timedOut = Boolean(timedOut);
+    this.terminal = Boolean(terminal);
   }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function readErrorBody(response, limit = 4096) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (bytes < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value).subarray(0, limit - bytes);
+      chunks.push(chunk);
+      bytes += chunk.length;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
 
 function userMessage(msg, fallback) {
   let m = (msg || '').trim();
@@ -216,7 +236,9 @@ export class SeedanceClient {
     let lastStatus = null;
     let fails = 0;
 
-    while (Date.now() < deadline) {
+    let firstPoll = true;
+    while (firstPoll || Date.now() < deadline) {
+      firstPoll = false;
       let resp;
       try {
         resp = await this.#fetchWithTimeout(`${this.#base}/api/task/${taskId}`);
@@ -236,7 +258,7 @@ export class SeedanceClient {
           await sleep(intervalMs); continue;
         }
         console.error(`[sd.waitForTask] HTTP ${resp.status}: ${t.slice(0, 300)}`);
-        throw new Sd2Error('Could not check generation status. Please try again.', { status: resp.status, body: t });
+        throw new Sd2Error('Could not check generation status. Please try again.', { status: resp.status, body: t, terminal: resp.status === 404 || resp.status === 410 });
       }
 
       fails = 0;
@@ -246,18 +268,39 @@ export class SeedanceClient {
 
       if (status === 'succeeded') {
         const url = data.content?.video_url;
-        if (!url) throw new Sd2Error('Generation finished but no video URL was returned.', { body: data });
+        if (!url) throw new Sd2Error('Generation finished but no video URL was returned.', { body: data, terminal: true });
         return { videoUrl: url, raw: data };
       }
       if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
         const code = data.error?.code || '';
         const msg = data.error?.message || `Generation ${status}.`;
         console.error(`[sd.waitForTask] ${status} code=${code}: ${msg}`);
-        throw new Sd2Error(userMessage(msg, 'Generation failed. Please try again.'), { code, body: data, blocked: BLOCK_RE.test(`${code} ${msg}`) });
+        throw new Sd2Error(userMessage(msg, 'Generation failed. Please try again.'), { code, body: data, blocked: BLOCK_RE.test(`${code} ${msg}`), terminal: true });
       }
-      await sleep(intervalMs);
+      await sleep(Math.max(0, Math.min(intervalMs, deadline - Date.now())));
     }
     throw new Sd2Error(`Generation timed out after ${timeoutMinutes} minutes.`, { timedOut: true });
+  }
+
+  async refreshResultUrl(taskId) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await this.#fetch(`${this.#base}/api/task/${encodeURIComponent(taskId)}`, {
+        signal: ctrl.signal, headers: { 'Cache-Control': 'no-cache' },
+      });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        throw new Sd2Error(`Could not refresh the video download link (HTTP ${response.status}).`, { status: response.status });
+      }
+      const data = await response.json();
+      if (data.status !== 'succeeded' || !data.content?.video_url) {
+        throw new Sd2Error('The provider has not supplied a downloadable result.');
+      }
+      return { videoUrl: data.content.video_url };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ─── Download (streamed to disk) ────────────────────────────────────────────
@@ -267,7 +310,20 @@ export class SeedanceClient {
     const filePath = path.join(os.tmpdir(), `sd-${randomBytes(8).toString('hex')}.mp4`);
     try {
       const resp = await this.#fetch(url, { signal: ctrl.signal });
-      if (!resp.ok) throw new Sd2Error('Could not download the result file.', { status: resp.status });
+      if (!resp.ok) {
+        const body = await readErrorBody(resp).catch(() => '');
+        let data;
+        try { data = JSON.parse(body); } catch { /* Some storage errors are XML. */ }
+        const reason = data?.Message ?? /<Message>([^<]*)<\/Message>/i.exec(body)?.[1] ?? '';
+        const expired = resp.status === 403 && /request has expired|request expired|expired (?:request|token)|token (?:has )?expired/i.test(reason);
+        const err = new Sd2Error(expired
+          ? 'The video download link has expired (HTTP 403).'
+          : `Could not download the result file (HTTP ${resp.status}).`,
+        { status: resp.status, code: data?.Code });
+        err.resultExpired = expired;
+        err.expiresAt = data?.Expires;
+        throw err;
+      }
       const contentType = resp.headers.get('content-type') || 'video/mp4';
       if (resp.body && typeof Readable.fromWeb === 'function') {
         await pipeline(Readable.fromWeb(resp.body), createWriteStream(filePath));
